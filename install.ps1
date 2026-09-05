@@ -290,7 +290,7 @@ namespace RBLXExecutor
 {
     public class MainForm : Form
     {
-        // ── Win32 P/Invoke ──────────────────────────────────────────────────────
+        // ── Win32 P/Invoke ─────────────────────────────────────────────────
         const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
 
         [DllImport("kernel32.dll", SetLastError=true)]
@@ -318,35 +318,36 @@ namespace RBLXExecutor
         [DllImport("kernel32.dll")]
         static extern bool GetExitCodeThread(IntPtr h, out uint code);
 
+        // Pseudo-handle -1 pour le processus courant (pas besoin d'OpenProcess)
         [DllImport("kernel32.dll")]
         static extern IntPtr GetCurrentProcess();
 
-        // ── NT API: bypass ACG via MEM_MAPPED (section objects) ───────────────────
-        // ACG bloque l'execution des pages MEM_PRIVATE (VirtualAllocEx).
-        // Les pages MEM_MAPPED creees par NtMapViewOfSection echappent au check.
+        // ── NT API: bypass ACG via MEM_MAPPED (section objects) ─────────────────
+        // ACG (ProcessDynamicCodePolicy) bloque les pages MEM_PRIVATE executables.
+        // Les pages MEM_MAPPED crees par NtMapViewOfSection echappent a ce check.
 
         [DllImport("ntdll.dll")]
         static extern int NtCreateSection(
             out IntPtr SectionHandle,
-            uint        DesiredAccess,
-            IntPtr      ObjectAttributes,
+            uint        DesiredAccess,      // 0xF001F = SECTION_ALL_ACCESS
+            IntPtr      ObjectAttributes,   // null = anonyme
             ref long    MaximumSize,
-            uint        SectionPageProtection,
-            uint        AllocationAttributes,
-            IntPtr      FileHandle);
+            uint        SectionPageProtection, // PAGE_EXECUTE_READWRITE = 0x40
+            uint        AllocationAttributes,  // SEC_COMMIT = 0x8000000
+            IntPtr      FileHandle);           // null = pagefile
 
         [DllImport("ntdll.dll")]
         static extern int NtMapViewOfSection(
             IntPtr   SectionHandle,
             IntPtr   ProcessHandle,
-            ref IntPtr BaseAddress,
-            UIntPtr  ZeroBits,
-            UIntPtr  CommitSize,
-            ref long SectionOffset,
-            ref UIntPtr ViewSize,
-            uint     InheritDisposition,
-            uint     AllocationType,
-            uint     Win32Protect);
+            ref IntPtr BaseAddress,          // 0 = OS choisit l'adresse
+            UIntPtr  ZeroBits,               // 0
+            UIntPtr  CommitSize,             // 0
+            ref long SectionOffset,          // offset dans la section
+            ref UIntPtr ViewSize,            // 0 = toute la section
+            uint     InheritDisposition,     // 2 = ViewUnmap
+            uint     AllocationType,         // 0
+            uint     Win32Protect);          // protection de la vue
 
         [DllImport("ntdll.dll")]
         static extern int NtUnmapViewOfSection(IntPtr ProcessHandle, IntPtr BaseAddress);
@@ -354,7 +355,36 @@ namespace RBLXExecutor
         [DllImport("ntdll.dll")]
         static extern int NtClose(IntPtr Handle);
 
-        // ── Scripts Lua pre-charges ──────────────────────────────────────────────
+        // ── NT APC injection (fallback si CreateRemoteThread bloque) ────────────
+        [DllImport("ntdll.dll")]
+        static extern int NtQueueApcThread(
+            IntPtr ThreadHandle, IntPtr ApcRoutine,
+            IntPtr SystemArgument1, IntPtr SystemArgument2, IntPtr SystemArgument3);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll")]
+        static extern bool Thread32First(IntPtr hSnap, ref THREADENTRY32 lpte);
+
+        [DllImport("kernel32.dll")]
+        static extern bool Thread32Next(IntPtr hSnap, ref THREADENTRY32 lpte);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct THREADENTRY32 {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ThreadID;
+            public uint th32OwnerProcessID;
+            public int  tpBasePri;
+            public int  tpDeltaPri;
+            public uint dwFlags;
+        }
+
+        // ── Scripts Lua pre-charges ───────────────────────────────────────────
         const string DASH_SCRIPT =
 @"-- INFINITE DASHES (Appuie Q pour dash sans cooldown)
 local Players = game:GetService('Players')
@@ -402,7 +432,7 @@ task.spawn(function()
     end
 end)";
 
-        // ── UI ─────────────────────────────────────────────────────────────────
+        // ── UI ────────────────────────────────────────────────────────────────
         RichTextBox scriptBox;
         ListBox     logBox;
         Button      injectBtn, execBtn, dashBtn, crashBtn, clearBtn;
@@ -411,7 +441,7 @@ end)";
 
         public MainForm()
         {
-            this.Text            = "RBX Executor v2.2";
+            this.Text            = "RBX Executor v2.3";
             this.Size            = new Size(800, 580);
             this.BackColor       = Color.FromArgb(12, 12, 28);
             this.ForeColor       = Color.White;
@@ -524,7 +554,7 @@ end)";
             bool ok = ManualMap(procs[0].Id, File.ReadAllBytes(dllPath), ref errMsg);
             if (ok) {
                 Log($"[+] INJECTION OK  ({errMsg})");
-                Log("[*] Attends 10-15s que FinderThread scanne Lua, puis EXECUTE");
+                Log("[*] Attends 10s que FinderThread scanne Lua, puis EXECUTE");
                 SetStatus("● Injecte OK", Color.FromArgb(40, 200, 40));
                 injected = true;
             } else {
@@ -566,19 +596,21 @@ end)";
         //  Hyperion active ProcessDynamicCodePolicy (ACG) sur Roblox.
         //  VirtualAllocEx cree des pages MEM_PRIVATE : execution bloquee
         //  avec STATUS_DYNAMIC_CODE_BLOCKED (0xC000071C).
-        //  NtMapViewOfSection cree des pages MEM_MAPPED : kernel ACG check
-        //  ne s'applique pas, execution autorisee.
+        //  NtMapViewOfSection cree des pages MEM_MAPPED : le kernel n'applique
+        //  pas le check ACG sur ces pages, l'execution est autorisee.
         //
         //  Flow:
-        //    1. NtCreateSection(SEC_COMMIT, RWX) pour l'image DLL
-        //    2. NtMapViewOfSection local (RW) -> patch relocs + imports
+        //    1. NtCreateSection (SEC_COMMIT, RWX) pour l'image DLL
+        //    2. NtMapViewOfSection local (RW) pour patcher relocs + imports
         //    3. NtMapViewOfSection remote (RWX) dans Roblox
-        //    4. Marshal.Copy image patchee -> section partagee -> Roblox voit
-        //    5. Meme chose pour bloc shellcode+params
-        //    6. CreateRemoteThread sur shellcode MEM_MAPPED -> pas de blocage ACG
+        //    4. Copie de l'image patchee dans la vue locale
+        //    5. Meme chose pour le bloc shellcode+params (section separee)
+        //    6. CreateRemoteThread sur le shellcode dans la section remote
+        //    7. Fallback: NtQueueApcThread si CRT refuse (Hyperion THREAD_BLOCK)
         // ──────────────────────────────────────────────────────────────────────
         static bool ManualMap(int pid, byte[] raw, ref string err)
         {
+            // ── Parse PE32+ headers ────────────────────────────────────
             if (raw.Length < 0x40 || raw[0] != 0x4D || raw[1] != 0x5A)
                 { err = "Bad MZ"; return false; }
             int pe = BitConverter.ToInt32(raw, 0x3C);
@@ -589,14 +621,15 @@ end)";
             if (BitConverter.ToUInt16(raw, oh) != 0x020B)
                 { err = "Besoin d'un DLL x64"; return false; }
 
-            uint epRva  = BitConverter.ToUInt32(raw, oh + 16);
-            ulong ib0   = BitConverter.ToUInt64(raw, oh + 24);
-            uint iSz    = BitConverter.ToUInt32(raw, oh + 56);
-            uint hSz    = BitConverter.ToUInt32(raw, oh + 60);
+            uint epRva  = BitConverter.ToUInt32(raw, oh + 16);  // AddressOfEntryPoint
+            ulong ib0   = BitConverter.ToUInt64(raw, oh + 24);  // ImageBase prefere
+            uint iSz    = BitConverter.ToUInt32(raw, oh + 56);  // SizeOfImage
+            uint hSz    = BitConverter.ToUInt32(raw, oh + 60);  // SizeOfHeaders
             int optSz   = BitConverter.ToUInt16(raw, pe + 20);
             int numSec  = BitConverter.ToUInt16(raw, pe + 6);
             int secOff  = pe + 24 + optSz;
 
+            // DataDirectory[1] = import, DataDirectory[5] = basereloc
             int  dd     = oh + 112;
             uint impRva = BitConverter.ToUInt32(raw, dd + 8);
             uint relRva = BitConverter.ToUInt32(raw, dd + 40);
@@ -606,51 +639,60 @@ end)";
             if (hP == IntPtr.Zero)
                 { err = $"OpenProcess err {Marshal.GetLastWin32Error()}"; return false; }
 
-            // ── Section DLL image (MEM_MAPPED, bypass ACG) ───────────────────────
+            // ── Section DLL image ─────────────────────────────────────────
+            // Taille alignee sur page (4 Ko)
             long dllSecSz = ((long)iSz + 0xFFF) & ~0xFFFL;
             IntPtr hDllSec;
             int nt = NtCreateSection(out hDllSec,
                 0xF001F,        // SECTION_ALL_ACCESS
-                IntPtr.Zero,
+                IntPtr.Zero,    // pas d'ObjectAttributes -> anonyme
                 ref dllSecSz,
                 0x40,           // PAGE_EXECUTE_READWRITE
                 0x8000000,      // SEC_COMMIT
-                IntPtr.Zero);
+                IntPtr.Zero);   // null FileHandle -> pagefile
             if (nt != 0) {
                 CloseHandle(hP);
                 err = $"NtCreateSection(dll)=0x{(uint)nt:X8}"; return false;
             }
 
+            // Vue locale en RW (ecriture de l'image)
             IntPtr localDll = IntPtr.Zero;
             long   secOff2  = 0L;
             UIntPtr viewSz  = UIntPtr.Zero;
             nt = NtMapViewOfSection(hDllSec, GetCurrentProcess(),
                 ref localDll, UIntPtr.Zero, UIntPtr.Zero,
-                ref secOff2, ref viewSz, 2, 0,
-                0x04);  // PAGE_READWRITE (vue locale pour ecriture)
+                ref secOff2, ref viewSz,
+                2,      // ViewUnmap
+                0,
+                0x04);  // PAGE_READWRITE
             if (nt != 0) {
                 NtClose(hDllSec); CloseHandle(hP);
                 err = $"NtMapViewOfSection(local dll)=0x{(uint)nt:X8}"; return false;
             }
 
+            // Vue remote dans Roblox en RWX (code + data accessibles)
             IntPtr remoteDll = IntPtr.Zero;
             secOff2 = 0L; viewSz = UIntPtr.Zero;
             nt = NtMapViewOfSection(hDllSec, hP,
                 ref remoteDll, UIntPtr.Zero, UIntPtr.Zero,
-                ref secOff2, ref viewSz, 2, 0,
-                0x40);  // PAGE_EXECUTE_READWRITE (code + data dans Roblox)
+                ref secOff2, ref viewSz,
+                2,      // ViewUnmap
+                0,
+                0x40);  // PAGE_EXECUTE_READWRITE
             if (nt != 0) {
                 NtUnmapViewOfSection(GetCurrentProcess(), localDll);
                 NtClose(hDllSec); CloseHandle(hP);
                 err = $"NtMapViewOfSection(remote dll)=0x{(uint)nt:X8}"; return false;
             }
 
-            // ── Construire l'image patchee ────────────────────────────────────────
+            // ── Construire l'image patchee en memoire locale ──────────────────
             byte[] mp = new byte[iSz];
 
+            // En-tetes PE
             uint cpH = Math.Min(hSz, (uint)raw.Length);
             Array.Copy(raw, 0, mp, 0, (int)cpH);
 
+            // Sections
             for (int i = 0; i < numSec; i++) {
                 int  sh   = secOff + i * 40;
                 uint vRva = BitConverter.ToUInt32(raw, sh + 12);
@@ -662,7 +704,7 @@ end)";
                 if (avail > 0) Array.Copy(raw, (int)rOff, mp, (int)vRva, (int)avail);
             }
 
-            // Relocations: delta = adresse reelle (remoteDll) - ImageBase prefere
+            // Relocations base (delta = adresse reelle dans Roblox - ImageBase prefere)
             if (relRva != 0 && relSz != 0) {
                 ulong delta = (ulong)remoteDll - ib0;
                 uint  rp   = relRva;
@@ -673,7 +715,7 @@ end)";
                     uint cnt = (blkSz - 8) / 2;
                     for (uint x = 0; x < cnt; x++) {
                         ushort entry = BitConverter.ToUInt16(mp, (int)(rp + 8 + x * 2));
-                        if ((entry >> 12) != 10) continue;  // IMAGE_REL_BASED_DIR64
+                        if ((entry >> 12) != 10) continue;   // IMAGE_REL_BASED_DIR64
                         uint loc = pageRva + (uint)(entry & 0xFFF);
                         if (loc + 8 > iSz) continue;
                         ulong v = BitConverter.ToUInt64(mp, (int)loc) + delta;
@@ -683,7 +725,7 @@ end)";
                 }
             }
 
-            // Imports
+            // Imports (GetProcAddress dans notre process = meme adresse, DLLs systeme)
             if (impRva != 0) {
                 uint id = impRva;
                 while (id + 20 <= iSz) {
@@ -719,17 +761,24 @@ end)";
                 }
             }
 
-            // Copie dans vue locale -> propagation automatique vers Roblox via section
+            // Copie dans la vue locale -> visible dans la vue remote via la section partagee
             Marshal.Copy(mp, 0, localDll, (int)iSz);
             NtUnmapViewOfSection(GetCurrentProcess(), localDll);
             NtClose(hDllSec);
 
-            // ── Section shellcode+params (aussi MEM_MAPPED) ─────────────────────
-            // Layout: [0..7]=hModule, [8..15]=DllMain, [16..41]=shellcode 26 bytes
+            // ── Section shellcode+params ──────────────────────────────────
+            // Layout: [0..7] = hModule (remoteDll), [8..15] = DllMain, [16..41] = shellcode
             ulong epAbs = (ulong)remoteDll + epRva;
 
-            // sub rsp,28h | mov rax,rcx | mov edx,1 | xor r8,r8
-            // mov rcx,[rax] | call [rax+8] | add rsp,28h | ret
+            // Shellcode 26 octets: appelle DllMain(hMod, DLL_PROCESS_ATTACH, 0)
+            //   sub rsp,28h
+            //   mov rax,rcx        ; rcx = pointeur vers le bloc params
+            //   mov edx,1          ; DLL_PROCESS_ATTACH
+            //   xor r8,r8
+            //   mov rcx,[rax]      ; hModule = params[0]
+            //   call [rax+8]       ; DllMain = params[8]
+            //   add rsp,28h
+            //   ret
             byte[] sc = new byte[26] {
                 0x48,0x83,0xEC,0x28,
                 0x48,0x8B,0xC1,
@@ -761,14 +810,15 @@ end)";
             secOff2 = 0L; viewSz = UIntPtr.Zero;
             NtMapViewOfSection(hScSec, GetCurrentProcess(),
                 ref localSc, UIntPtr.Zero, UIntPtr.Zero,
-                ref secOff2, ref viewSz, 2, 0, 0x04);
+                ref secOff2, ref viewSz, 2, 0,
+                0x04);  // PAGE_READWRITE (ecriture locale)
 
             IntPtr remoteSc = IntPtr.Zero;
             secOff2 = 0L; viewSz = UIntPtr.Zero;
             nt = NtMapViewOfSection(hScSec, hP,
                 ref remoteSc, UIntPtr.Zero, UIntPtr.Zero,
                 ref secOff2, ref viewSz, 2, 0,
-                0x20);  // PAGE_EXECUTE_READ
+                0x20);  // PAGE_EXECUTE_READ (execution dans Roblox)
             if (nt != 0) {
                 NtUnmapViewOfSection(GetCurrentProcess(), localSc);
                 NtClose(hScSec);
@@ -777,35 +827,73 @@ end)";
                 err = $"NtMapViewOfSection(remote sc)=0x{(uint)nt:X8}"; return false;
             }
 
+            // Ecriture shellcode dans la vue locale
             Marshal.Copy(scBlock, 0, localSc, scBlock.Length);
             NtUnmapViewOfSection(GetCurrentProcess(), localSc);
             NtClose(hScSec);
 
-            // ── Thread dans Roblox sur shellcode MEM_MAPPED ─────────────────────
-            // Entry = remoteSc+16 (shellcode), Param = remoteSc (params block)
+            // ── Lancer le thread dans Roblox ──────────────────────────────
+            // Methode A : CreateRemoteThread (MEM_MAPPED -> pas bloque par ACG)
+            // Methode B : NtQueueApcThread   (fallback si CRT refuse)
             uint tid;
             IntPtr hThread = CreateRemoteThread(hP, IntPtr.Zero, 0,
-                IntPtr.Add(remoteSc, 16),
-                remoteSc,
+                IntPtr.Add(remoteSc, 16),   // entry = shellcode
+                remoteSc,                   // param = params block
                 0, out tid);
-            if (hThread == IntPtr.Zero) {
+
+            if (hThread != IntPtr.Zero) {
+                // CRT reussi : attendre et lire exit code
+                WaitForSingleObject(hThread, 8000);
+                uint exitCode = 0xDEAD;
+                GetExitCodeThread(hThread, out exitCode);
+                CloseHandle(hThread);
+                NtUnmapViewOfSection(hP, remoteSc);
+                CloseHandle(hP);
+                err = $"CRT ok threadExit=0x{exitCode:X}";
+                return true;
+            }
+
+            // ── Fallback APC: Hyperion bloque CRT ───────────────────────────
+            // NtQueueApcThread sur chaque thread Roblox.
+            // L'APC se declenche quand un thread entre en attente alertable.
+            // Meme shellcode : rcx = arg1 = remoteSc (params block)
+            int crtErr = Marshal.GetLastWin32Error();
+            bool apcOk = false;
+            int  apcCnt = 0;
+
+            IntPtr hSnap = CreateToolhelp32Snapshot(0x4 /*TH32CS_SNAPTHREAD*/, 0);
+            if (hSnap != (IntPtr)(-1)) {
+                var te = new THREADENTRY32();
+                te.dwSize = (uint)Marshal.SizeOf<THREADENTRY32>();
+                if (Thread32First(hSnap, ref te)) {
+                    do {
+                        if ((int)te.th32OwnerProcessID != pid) continue;
+                        IntPtr hThr = OpenThread(0x1F03FF, false, te.th32ThreadID);
+                        if (hThr == IntPtr.Zero) continue;
+                        // ApcRoutine = shellcode a remoteSc+16
+                        // Arg1       = remoteSc (params: [0]=hModule, [8]=DllMain)
+                        int aqr = NtQueueApcThread(hThr,
+                            IntPtr.Add(remoteSc, 16), remoteSc,
+                            IntPtr.Zero, IntPtr.Zero);
+                        if (aqr == 0) { apcCnt++; apcOk = true; }
+                        CloseHandle(hThr);
+                    } while (Thread32Next(hSnap, ref te));
+                }
+                CloseHandle(hSnap);
+            }
+
+            if (!apcOk) {
                 NtUnmapViewOfSection(hP, remoteSc);
                 NtUnmapViewOfSection(hP, remoteDll);
                 CloseHandle(hP);
-                err = $"CreateRemoteThread err {Marshal.GetLastWin32Error()}";
+                err = $"CRT err {crtErr} + APC echec";
                 return false;
             }
 
-            WaitForSingleObject(hThread, 8000);
-            uint exitCode = 0xDEAD;
-            GetExitCodeThread(hThread, out exitCode);
-            CloseHandle(hThread);
-
-            NtUnmapViewOfSection(hP, remoteSc);  // shellcode plus necessaire
-            // remoteDll reste mappe: FinderThread + PipeThread tournent dessus
+            // remoteSc reste mappe : APC peut encore se declencher
+            // remoteDll reste mappe : FinderThread + PipeThread
             CloseHandle(hP);
-
-            err = $"threadExit=0x{exitCode:X}";
+            err = $"APC queued x{apcCnt} threads (CRT err {crtErr})";
             return true;
         }
 
@@ -819,7 +907,7 @@ end)";
     }
 }
 '@
-Write-Host "[+] MainForm.cs ecrit (ACG bypass NtMapViewOfSection)" -ForegroundColor Green
+Write-Host "[+] MainForm.cs ecrit (ACG bypass NtMapViewOfSection + APC fallback)" -ForegroundColor Green
 
 # ────────────────────────────────────────────────────────────
 #  3) executor.csproj
@@ -903,7 +991,7 @@ Write-Host "[+] RBLXExecutor.exe copie !" -ForegroundColor Green
 # ────────────────────────────────────────────────────────────
 Write-Host ""
 Write-Host "╔═════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║       INSTALLATION COMPLETE (v2.2 ACG)      ║" -ForegroundColor Green
+Write-Host "║     INSTALLATION COMPLETE (v2.3 ACG+APC)    ║" -ForegroundColor Green
 Write-Host "╚═════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Fichiers dans : $dest" -ForegroundColor White
@@ -913,11 +1001,13 @@ Write-Host ""
 Write-Host "  PROCEDURE :" -ForegroundColor Yellow
 Write-Host "  1. Lance Roblox et rejoins une partie" -ForegroundColor White
 Write-Host "  2. Lance RBLXExecutor.exe (en Admin si besoin)" -ForegroundColor White
-Write-Host "  3. Clique INJECT  (attends 'INJECTION OK threadExit=0x1')" -ForegroundColor White
+Write-Host "  3. Clique INJECT  (attends 'INJECTION OK')" -ForegroundColor White
 Write-Host "  4. Attends 10-15 secondes" -ForegroundColor White
 Write-Host "  5. Clique  INFINITE DASHES  ou  CRASH  puis EXECUTE" -ForegroundColor White
 Write-Host ""
 Write-Host "  Debug log: $dbg" -ForegroundColor Gray
-Write-Host "  -> Si OK: '[DllMain] DLL_PROCESS_ATTACH - injection OK !'" -ForegroundColor Gray
-Write-Host "  -> Puis:  '[FinderThread] Lua TROUVE !'" -ForegroundColor Gray
+Write-Host "  -> Si CRT ok: 'CRT ok threadExit=0x1'" -ForegroundColor Gray
+Write-Host "  -> Si APC:    'APC queued xN threads'" -ForegroundColor Gray
+Write-Host "  -> DLL log:   '[DllMain] DLL_PROCESS_ATTACH - injection OK !'" -ForegroundColor Gray
+Write-Host "  -> Puis:      '[FinderThread] Lua TROUVE !'" -ForegroundColor Gray
 Write-Host ""
