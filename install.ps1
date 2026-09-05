@@ -279,7 +279,7 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         auto NtSIT = reinterpret_cast<BOOL(__stdcall*)(HANDLE,ULONG,PVOID,ULONG)>(
             GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationThread"));
         if (NtSIT) NtSIT(GetCurrentThread(), 0x11, nullptr, 0);
-        dbg("[DllMain] OK - EXECUTE pour executer");
+        // ZERO I/O ici - thread hijacke tient des locks Roblox. Tout syscall bloquant = crash.
     }
     return TRUE;
 }
@@ -1592,7 +1592,7 @@ Write-Host "=== Compilation rbx_hook.dll ===" -ForegroundColor Cyan
 $cpp = "$hook\rbx_hook.cpp"
 $dll = "$dest\rbx_hook.dll"
 
-$dbg = "$env:USERPROFILE\Desktop\rbx_debug.txt"
+$dbg = "C:\Windows\Temp\rbx_debug.txt"
 if (Test-Path $dbg) { Remove-Item $dbg -Force }
 
 $gppArgs = "`"$gpp`" -O2 -std=c++17 -shared -nostartfiles -Wl,-e,DllMain " +
