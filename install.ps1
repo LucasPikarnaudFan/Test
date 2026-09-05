@@ -265,30 +265,37 @@ extern "C" __declspec(dllexport) DWORD WINAPI RbxExecute(const char* script, int
 extern "C" __declspec(dllexport) DWORD WINAPI ExecFromParam(LPVOID param) {
     const char* s = (const char*)param;
     if (!s) return 2;
-    return RbxExecute(s, lstrlenA(s));
+    // Appel tryExecScript: fait le scan Lua en un seul passage si pas encore pret.
+    return tryExecScript(s, lstrlenA(s)) ? 0 : 1;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        dbg("[DllMain] attached - scan Lua sync (2s max, 0 thread cree)");
-
+        // Retour IMMEDIAT - le thread hijacke tient des locks Roblox (render/physics).
+        // Tout blocage ici = deadlock = crash. Zero scan, zero Sleep, zero threads.
+        // L'execution Lua se fera via TCtxHijack externe (M10 DirectLua depuis C#).
         auto NtSIT = reinterpret_cast<BOOL(__stdcall*)(HANDLE,ULONG,PVOID,ULONG)>(
             GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationThread"));
         if (NtSIT) NtSIT(GetCurrentThread(), 0x11, nullptr, 0);
-
-        // Scan Lua synchronement dans le thread hijacke (pas de CreateThread/QueueUserWorkItem).
-        // Hyperion n'a rien a tuer. Timeout 2s pour ne pas bloquer Roblox trop longtemps.
-        for (int i = 0; i < 20; i++) {
-            if (findLua()) {
-                InterlockedExchange(&g_ready, 1);
-                dbg("[DllMain] Lua FOUND sync !");
-                return TRUE;
-            }
-            Sleep(100);
-        }
-        dbg("[DllMain] Lua non trouve en 2s - EXECUTE tentera M10 (scan externe)");
+        dbg("[DllMain] OK - EXECUTE pour executer");
     }
     return TRUE;
+}
+
+// Appele depuis ExecFromParam (via TCtxHijack au moment EXECUTE).
+// Fait un scan Lua en un seul passage (pas de Sleep/loop = safe en thread game).
+static bool tryExecScript(const char* script, int len) {
+    if (InterlockedCompareExchange(&g_ready, 0, 0) != 1) {
+        // Un seul passage de scan - typiquement <50ms
+        if (findLua()) InterlockedExchange(&g_ready, 1);
+    }
+    if (InterlockedCompareExchange(&g_ready, 0, 0) != 1) return false;
+    void* L = g_stateRef ? *g_stateRef : nullptr;
+    if (!L || !g_load || !g_pcall) return false;
+    int r = g_load(L, script, (size_t)len, "=rbx");
+    if (r == 0) g_pcall(L, 0, -1, 0);
+    dbg(r == 0 ? "[Exec] OK" : "[Exec] LOAD_ERR");
+    return r == 0;
 }
 '@
 Write-Host "[+] rbx_hook.cpp ecrit" -ForegroundColor Green
@@ -623,7 +630,7 @@ end)";
             }
             if (ok) {
                 Log($"[+] INJECTION OK  ({errMsg})");
-                Log("[*] DllMain scanne Lua sync (2s) - puis EXECUTE directement");
+                Log("[*] DLL injectee - clique EXECUTE pour lancer le script");
                 SetStatus("● Injecte OK", Color.FromArgb(40, 200, 40));
                 injected = true;
                 _rbxPid    = procs[0].Id;
@@ -942,17 +949,26 @@ end)";
         }
 
         // ── Method 10: Direct lua shellcode via external pattern scan ───
+        // blk10 layout (each field 8-byte aligned):
+        //   [0..7]   luaStateAddr  (L value read from global ptr)
+        //   [8..15]  luaLoadAddr   (lua_loadbuffer)
+        //   [16..23] luaPcallAddr  (lua_pcall)
+        //   [24..31] scriptPtr     (remote MEM_MAPPED string)
+        //   [32..35] scriptLen     (DWORD)
+        //   [36..39] padding
+        //   [40..47] "=rbx\0\0\0\0" (tag string inline, 8 bytes)
+        //   [48..55] origRip slot  (filled per-thread by WriteProcessMemory)
+        //   [56..63] padding
+        //   [64..]   shellcode
         bool TryDirectLua(IntPtr hP, int pid, IntPtr scriptPtr, uint scriptLen) {
-            // Scan Roblox memory for lua_State and lua_loadbuffer from outside
             ulong luaStateAddr = 0, luaLoadAddr = 0, luaPcallAddr = 0;
-            var rprocs = Process.GetProcessesByName("RobloxPlayerBeta");
-            if (rprocs.Length == 0) return false;
 
-            // Scan readable regions for Lua patterns using ReadProcessMemory
+            // External scan via ReadProcessMemory
             byte[] rBuf = new byte[0x10000];
             IntPtr cur = (IntPtr)0x10000;
             long limit = 0x7FFFFFFFFFFF;
-            while ((long)cur < limit && (luaStateAddr == 0 || luaLoadAddr == 0)) {
+            bool needState = true, needLoad = true, needPcall = true;
+            while ((long)cur < limit && (needState || needLoad || needPcall)) {
                 var mbi = new MEMORY_BASIC_INFORMATION();
                 if (VirtualQueryEx(hP, cur, ref mbi, (uint)Marshal.SizeOf<MEMORY_BASIC_INFORMATION>()) == 0) break;
                 ulong next = (ulong)mbi.BaseAddress + mbi.RegionSize;
@@ -962,25 +978,36 @@ end)";
                     ulong rSize  = mbi.RegionSize;
                     for (ulong off = 0; off + (ulong)rBuf.Length <= rSize; off += (ulong)(rBuf.Length / 2)) {
                         int rd = 0;
-                        if (!ReadProcessMemory(hP, (IntPtr)(rStart + off), rBuf, rBuf.Length, out rd) || rd < 12) continue;
-                        // State pattern: 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ??
-                        for (int i = 0; i + 12 <= rd && luaStateAddr == 0; i++) {
-                            if (rBuf[i]==0x48&&rBuf[i+1]==0x8B&&rBuf[i+2]==0x05&&rBuf[i+7]==0x48&&rBuf[i+8]==0x85&&rBuf[i+9]==0xC0&&rBuf[i+10]==0x74) {
-                                int rel = BitConverter.ToInt32(rBuf, i+3);
-                                ulong sv = rStart + off + (ulong)i + 7 + (ulong)rel;
-                                byte[] ptrBuf = new byte[8]; int pr = 0;
-                                if (ReadProcessMemory(hP, (IntPtr)sv, ptrBuf, 8, out pr) && pr == 8) {
-                                    ulong L = BitConverter.ToUInt64(ptrBuf, 0);
-                                    if (L > 0x10000 && L < 0x7FFFFFFFFFFF) luaStateAddr = L;
-                                }
-                            }
+                        if (!ReadProcessMemory(hP, (IntPtr)(rStart + off), rBuf, rBuf.Length, out rd) || rd < 15) continue;
+                        // lua_State pattern: 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ??
+                        for (int i = 0; i + 12 <= rd && needState; i++) {
+                            if (rBuf[i]!=0x48||rBuf[i+1]!=0x8B||rBuf[i+2]!=0x05) continue;
+                            if (rBuf[i+7]!=0x48||rBuf[i+8]!=0x85||rBuf[i+9]!=0xC0||rBuf[i+10]!=0x74) continue;
+                            int rel = BitConverter.ToInt32(rBuf, i+3);
+                            ulong sv = rStart + off + (ulong)i + 7 + (ulong)(long)rel;
+                            byte[] pb = new byte[8]; int pr = 0;
+                            if (!ReadProcessMemory(hP, (IntPtr)sv, pb, 8, out pr) || pr != 8) continue;
+                            ulong L = BitConverter.ToUInt64(pb, 0);
+                            if (L > 0x10000 && L < (ulong)limit) { luaStateAddr = L; needState = false; }
                         }
-                        // loadbuffer pattern: 48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 30
-                        for (int i = 0; i + 15 <= rd && luaLoadAddr == 0; i++) {
+                        // lua_loadbuffer: 48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 30
+                        for (int i = 0; i + 15 <= rd && needLoad; i++) {
                             if (rBuf[i]==0x48&&rBuf[i+1]==0x89&&rBuf[i+2]==0x5C&&rBuf[i+3]==0x24&&
                                 rBuf[i+5]==0x48&&rBuf[i+6]==0x89&&rBuf[i+7]==0x74&&rBuf[i+8]==0x24&&
                                 rBuf[i+10]==0x57&&rBuf[i+11]==0x48&&rBuf[i+12]==0x83&&rBuf[i+13]==0xEC&&rBuf[i+14]==0x30)
-                                luaLoadAddr = rStart + off + (ulong)i;
+                            { luaLoadAddr = rStart + off + (ulong)i; needLoad = false; }
+                        }
+                        // lua_pcall: 40 53 48 83 EC 20 49 8B D8 E8 -- or -- 48 89 5C 24 ?? 57 48 83 EC 20 48 8B FA
+                        for (int i = 0; i + 11 <= rd && needPcall; i++) {
+                            if (rBuf[i]==0x40&&rBuf[i+1]==0x53&&rBuf[i+2]==0x48&&rBuf[i+3]==0x83&&
+                                rBuf[i+4]==0xEC&&rBuf[i+5]==0x20&&rBuf[i+6]==0x49&&rBuf[i+7]==0x8B&&rBuf[i+8]==0xD8)
+                            { luaPcallAddr = rStart + off + (ulong)i; needPcall = false; }
+                        }
+                        for (int i = 0; i + 11 <= rd && needPcall; i++) {
+                            if (rBuf[i]==0x48&&rBuf[i+1]==0x89&&rBuf[i+2]==0x5C&&rBuf[i+3]==0x24&&
+                                rBuf[i+5]==0x57&&rBuf[i+6]==0x48&&rBuf[i+7]==0x83&&rBuf[i+8]==0xEC&&
+                                rBuf[i+9]==0x20&&rBuf[i+10]==0x48&&rBuf[i+11-1+1]==0x8B)
+                            { luaPcallAddr = rStart + off + (ulong)i; needPcall = false; }
                         }
                     }
                 }
@@ -989,118 +1016,85 @@ end)";
             }
 
             if (luaStateAddr == 0 || luaLoadAddr == 0) {
-                Log($"[-] M10 lua_State={luaStateAddr:X} loadAddr={luaLoadAddr:X} - patterns non trouves"); return false;
+                Log($"[-] M10 state=0x{luaStateAddr:X} load=0x{luaLoadAddr:X} pcall=0x{luaPcallAddr:X} - patterns manquants");
+                return false;
             }
-            Log($"[*] M10 lua_State=0x{luaStateAddr:X} load=0x{luaLoadAddr:X}");
+            Log($"[*] M10 state=0x{luaStateAddr:X} load=0x{luaLoadAddr:X} pcall=0x{luaPcallAddr:X}");
+            if (luaPcallAddr == 0) {
+                Log("[-] M10 lua_pcall non trouve - script charge mais pas execute"); return false;
+            }
 
-            // Build shellcode: call lua_loadbuffer(L, script, len, "=rbx") + lua_pcall(L,0,-1,0)
-            // We need pcall - try simple heuristic: search near loadbuffer
-            // For now: use lua_dostring equivalent: just loadbuffer + pcall
-            // pcall addr: not found yet - approximate as loadbuffer + offset (fragile; use if no better option)
-            // Build shellcode block via NtMapViewOfSection
-            byte[] tag10 = System.Text.Encoding.ASCII.GetBytes("=rbx\0");
+            // Build shellcode block via NtMapViewOfSection (MEM_MAPPED = ACG-safe)
             byte[] blk10 = new byte[0x400];
-            // Layout:
-            // [0..7]   lua_State value
-            // [8..15]  lua_loadbuffer addr
-            // [16..23] scriptPtr (remote)
-            // [24..27] scriptLen (DWORD)
-            // [28..35] tag string "=rbx\0"
-            // [64..]   shellcode
-            Array.Copy(BitConverter.GetBytes(luaStateAddr), 0, blk10,  0, 8);
-            Array.Copy(BitConverter.GetBytes(luaLoadAddr),  0, blk10,  8, 8);
-            Array.Copy(BitConverter.GetBytes((ulong)scriptPtr), 0, blk10, 16, 8);
-            Array.Copy(BitConverter.GetBytes(scriptLen),    0, blk10, 24, 4);
-            Array.Copy(tag10,                               0, blk10, 28, tag10.Length);
-
-            // Shellcode at blk10+64 (rcx = remBlk10 base when hijacked):
-            // call lua_loadbuffer(L, script, len, "=rbx")
-            // R11=origRip R10=rsp
-            // rcx=L rdx=script r8=len r9="=rbx" then call [rcx+8]
+            Array.Copy(BitConverter.GetBytes(luaStateAddr),      0, blk10,  0, 8);
+            Array.Copy(BitConverter.GetBytes(luaLoadAddr),       0, blk10,  8, 8);
+            Array.Copy(BitConverter.GetBytes(luaPcallAddr),      0, blk10, 16, 8);
+            Array.Copy(BitConverter.GetBytes((ulong)scriptPtr),  0, blk10, 24, 8);
+            Array.Copy(BitConverter.GetBytes(scriptLen),         0, blk10, 32, 4);
+            // tag "=rbx\0" at offset 40
+            byte[] tag10 = System.Text.Encoding.ASCII.GetBytes("=rbx\0\0\0\0");
+            Array.Copy(tag10, 0, blk10, 40, 8);
+            // origRip slot at offset 48 (filled by WriteProcessMemory before SetThreadContext)
+            // shellcode at offset 64:
+            //
+            // Calling convention: rcx = remBlk10 (base pointer)
+            // We use rbx/rdi/rsi as non-volatile scratch so we survive the calls.
+            //
+            // push rbx; push rdi; push rsi
+            // mov rbx, rcx          ; save base
+            // mov rdi, rsp          ; save original rsp
+            // and rsp, -16          ; align
+            // sub rsp, 0x38         ; shadow space (0x20) + r9 slot + 2 spare
+            // mov r11, [rbx+0x30]   ; origRip from offset 48
+            // -- lua_loadbuffer(L, script, len, "=rbx") --
+            // mov rcx, [rbx+0]      ; L
+            // mov rdx, [rbx+24]     ; scriptPtr
+            // mov r8d, [rbx+32]     ; scriptLen (zero-extends to r8)
+            // lea r9, [rbx+40]      ; "=rbx" tag inline
+            // call [rbx+8]          ; lua_loadbuffer
+            // test eax, eax
+            // jnz skip_pcall        ; load failed, skip pcall
+            // -- lua_pcall(L, 0, -1, 0) --
+            // mov rcx, [rbx+0]      ; L
+            // xor edx, edx          ; nargs=0
+            // mov r8d, 0xFFFFFFFF   ; nresults=-1
+            // xor r9d, r9d          ; errfunc=0
+            // call [rbx+16]         ; lua_pcall
+            // skip_pcall:
+            // mov rsp, rdi
+            // pop rsi; pop rdi; pop rbx
+            // jmp r11
             byte[] sc10 = new byte[] {
-                // origRip at [rcx]: mov r11,[rcx+origRip slot at end, but here rcx IS remBlk10]
-                // for this shellcode via TCtxHijack, rcx=remBlk10
-                0x4C,0x8B,0x59,0x78,        // mov r11,[rcx+0x78]  (origRip at offset 120)
-                0x4C,0x8B,0xD4,             // mov r10,rsp
-                0x48,0x83,0xE4,0xF0,        // and rsp,-16
-                0x48,0x83,0xEC,0x30,        // sub rsp,0x30  (shadow+1 extra for r9 reg call)
-                0x4C,0x8B,0x41,0x1C,        // mov r8d,[rcx+0x1C]  scriptLen as r8d... wait need r8=len
-                // actually r8 is 64-bit: use movzx or just mov r8d (zero-extends)
-                0x44,0x8B,0x41,0x18,        // mov r8d,[rcx+0x18]  scriptLen DWORD
-                0x49,0x8D,0x49,0x1C,        // lea rcx,[rcx+0x1C]... no wait
-                // Let me redo this properly:
-                // We need: rcx=L, rdx=scriptPtr, r8=scriptLen, r9="=rbx" ptr, rax=loadbuffer
-                // But rcx is our base ptr. Save it first.
-                0x00 // placeholder - rewrite below
+                0x53,                               // push rbx
+                0x57,                               // push rdi
+                0x56,                               // push rsi
+                0x48,0x89,0xCB,                     // mov rbx, rcx
+                0x48,0x89,0xE7,                     // mov rdi, rsp
+                0x48,0x83,0xE4,0xF0,                // and rsp, -16
+                0x48,0x83,0xEC,0x38,                // sub rsp, 0x38
+                0x4C,0x8B,0x5B,0x30,                // mov r11, [rbx+0x30]   origRip@48
+                0x48,0x8B,0x0B,                     // mov rcx, [rbx]        L
+                0x48,0x8B,0x53,0x18,                // mov rdx, [rbx+0x18]   scriptPtr@24
+                0x44,0x8B,0x43,0x20,                // mov r8d, [rbx+0x20]   scriptLen@32
+                0x4C,0x8D,0x4B,0x28,                // lea r9, [rbx+0x28]    tag@40
+                0xFF,0x53,0x08,                     // call [rbx+8]           lua_loadbuffer
+                0x85,0xC0,                          // test eax, eax
+                0x75,0x11,                          // jnz skip_pcall (+17 bytes)
+                // lua_pcall(L, 0, -1, 0):
+                0x48,0x8B,0x0B,                     // mov rcx, [rbx]        L
+                0x33,0xD2,                          // xor edx, edx          nargs=0
+                0x41,0xB8,0xFF,0xFF,0xFF,0xFF,      // mov r8d, -1           nresults=-1
+                0x45,0x33,0xC9,                     // xor r9d, r9d          errfunc=0
+                0xFF,0x53,0x10,                     // call [rbx+0x10]        lua_pcall@16
+                // skip_pcall:
+                0x48,0x89,0xFC,                     // mov rsp, rdi
+                0x5E,                               // pop rsi
+                0x5F,                               // pop rdi
+                0x5B,                               // pop rbx
+                0x41,0xFF,0xE3                      // jmp r11
             };
-            // The above got messy. Build it properly:
-            sc10 = new byte[] {
-                // rcx = remBlk10
-                0x48,0x89,0x4C,0x24,0x08,   // mov [rsp+8], rcx  (save base ptr on stack, shadow area)
-                0x4C,0x8B,0x59,0x78,        // mov r11, [rcx+0x78] (origRip slot at offset 120)
-                0x4C,0x8B,0xD4,             // mov r10, rsp
-                0x48,0x83,0xE4,0xF0,        // and rsp, -16
-                0x48,0x83,0xEC,0x30,        // sub rsp, 0x30
-                0x48,0x8B,0x44,0x24,0x38,   // mov rax, [rsp+0x38]  (base ptr from original rsp+8, now rsp+0x30+8=0x38)
-                0x48,0x8B,0x08,             // mov rcx, [rax+0]   L
-                0x48,0x8B,0x50,0x10,        // mov rdx, [rax+16]  scriptPtr
-                0x44,0x8B,0x40,0x18,        // mov r8d, [rax+24]  scriptLen
-                0x48,0x8D,0x48,0x1C,        // lea rcx_r9, [rax+28] "=rbx"
-                // Argh, rcx is already used for L. Need to use r9 separately.
-                // Use r9 = lea [rax+28]:
-                0x4C,0x8D,0x48,0x1C,        // lea r9, [rax+28]  "=rbx"
-                0xFF,0x50,0x08,             // call [rax+8]   lua_loadbuffer
-                // Stack: rsp is 0x30 below aligned. rax is clobbered by call. Restore base:
-                0x48,0x8B,0x44,0x24,0x38,   // mov rax, [rsp+0x38]  base ptr again
-                0x48,0x8B,0x4C,0x24,0x38,   // mov rcx, [rsp+0x38]  base again... wait
-                // Actually rcx got overwritten by call. We need L for pcall.
-                // Simplify: skip pcall for now, loadbuffer+dostring is enough if we use lua_dostring
-                // Actually lua_loadbuffer only loads; need pcall.
-                // Let's use a simpler approach: no pcall, rely on lua_dostring pattern if available.
-                // For now just call loadbuffer, accept that it won't execute without pcall.
-                // Instead let's just return and note in log that M10 needs pcall addr.
-                0x48,0x83,0xC4,0x30,        // add rsp, 0x30
-                0x4D,0x8B,0xE2,             // mov rsp, r10
-                0x41,0xFF,0xE3             // jmp r11
-            };
-            // The shellcode above is getting complicated. Let me use a cleaner version:
-            // rcx=base, save rcx, set up args, call loadbuffer. No pcall = script loads but not runs.
-            // For M10 to actually execute script, need pcall. Skip for now, use a stub.
-            // This method serves as a diagnostic - if it shows [*] M10 lua found, we can add pcall.
-            Log("[*] M10 lua_State found - shellcode injection via TCtxHijack");
+            Array.Copy(sc10, 0, blk10, 64, sc10.Length);
 
-            byte[] blk10final = new byte[0x400];
-            Array.Copy(BitConverter.GetBytes(luaStateAddr), 0, blk10final,  0, 8);
-            Array.Copy(BitConverter.GetBytes(luaLoadAddr),  0, blk10final,  8, 8);
-            Array.Copy(BitConverter.GetBytes((ulong)scriptPtr), 0, blk10final, 16, 8);
-            Array.Copy(BitConverter.GetBytes(scriptLen),    0, blk10final, 24, 4);
-            Array.Copy(tag10,                               0, blk10final, 28, tag10.Length);
-            // origRip slot at offset 64
-            // shellcode at offset 80:
-            byte[] sc10f = new byte[] {
-                0x4C,0x8B,0x51,0x40,        // mov r10,[rcx+64]    origRip slot
-                0x53,                       // push rbx
-                0x48,0x89,0xCB,             // mov rbx, rcx        save base
-                0x48,0x83,0xE4,0xF0,        // and rsp,-16
-                0x48,0x83,0xEC,0x30,        // sub rsp,0x30
-                0x48,0x8B,0x0B,             // mov rcx,[rbx+0]     L
-                0x48,0x8B,0x53,0x10,        // mov rdx,[rbx+16]    scriptPtr
-                0x44,0x8B,0x43,0x18,        // mov r8d,[rbx+24]    scriptLen
-                0x4C,0x8D,0x4B,0x1C,        // lea r9,[rbx+28]     "=rbx"
-                0xFF,0x53,0x08,             // call [rbx+8]        lua_loadbuffer -> eax=0 if ok
-                0x85,0xC0,                  // test eax,eax
-                0x75,0x0D,                  // jnz skip_pcall
-                // pcall: we don't have addr; call with 0 args, -1 results, 0 errfunc
-                // skip pcall for now
-                0x90,0x90,0x90,0x90,        // nop x4 placeholder
-                0x90,0x90,0x90,0x90,0x90,   // nop x5
-                0x90,0x90,0x90,             // nop x3  (jnz target)
-                0x48,0x83,0xC4,0x30,        // add rsp,0x30
-                0x5B,                       // pop rbx
-                0x41,0xFF,0xE2             // jmp r10
-            };
-            Array.Copy(sc10f, 0, blk10final, 80, sc10f.Length);
-            // origRip slot at 64
             long blk10Sz = 0x400L;
             IntPtr hB10; IntPtr locB10 = IntPtr.Zero, remB10 = IntPtr.Zero;
             int ntB = NtCreateSection(out hB10, 0xF001F, IntPtr.Zero,
@@ -1110,7 +1104,7 @@ end)";
             NtMapViewOfSection(hB10, GetCurrentProcess(), ref locB10,
                 UIntPtr.Zero, UIntPtr.Zero, ref o10, ref vz10, 2, 0, 0x04);
             if (locB10 == IntPtr.Zero) { NtClose(hB10); return false; }
-            Marshal.Copy(blk10final, 0, locB10, blk10final.Length);
+            Marshal.Copy(blk10, 0, locB10, blk10.Length);
             NtUnmapViewOfSection(GetCurrentProcess(), locB10);
             o10=0; vz10=UIntPtr.Zero;
             ntB = NtMapViewOfSection(hB10, hP, ref remB10,
@@ -1118,9 +1112,9 @@ end)";
             NtClose(hB10);
             if (ntB != 0) { Log($"[-] M10 MapRem=0x{(uint)ntB:X8}"); return false; }
 
-            // Hijack a thread with this shellcode
-            bool ok10 = TryTCtxHijackExecAt(hP, pid, (ulong)remB10, 64, 80);
-            Log(ok10 ? "[+] M10 DirectLua shellcode injected !" : "[-] M10 TCtxHijack echec");
+            // TCtxHijack: origRip slot at blk offset 48, shellcode at offset 64
+            bool ok10 = TryTCtxHijackExecAt(hP, pid, (ulong)remB10, 48, 64);
+            Log(ok10 ? "[+] M10 DirectLua OK !" : "[-] M10 TCtxHijack echec");
             return ok10;
         }
 
