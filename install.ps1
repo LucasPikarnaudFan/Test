@@ -20,7 +20,7 @@ Write-Host "  ██║  ██║██████╔╝██╔╝ ██╗
 Write-Host "  ╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝  EXECUTOR INSTALLER" -ForegroundColor Cyan
 Write-Host ""
 
-# ── Pre-checks ────────────────────────────────────────────
+# ── Pre-checks ──────────────────────────────────────────────
 if (!(Test-Path $gpp)) {
     Write-Host "[!] g++ introuvable. Installe MSYS2 + MinGW64 d'abord." -ForegroundColor Red
     Write-Host "    https://www.msys2.org/ puis: pacman -S mingw-w64-x86_64-gcc" -ForegroundColor Yellow
@@ -31,7 +31,7 @@ try { $null = dotnet --version } catch {
     exit 1
 }
 
-# ── Dossiers ────────────────────────────────────────────
+# ── Dossiers ────────────────────────────────────────────────
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 New-Item -ItemType Directory -Force -Path $src  | Out-Null
 New-Item -ItemType Directory -Force -Path $hook | Out-Null
@@ -290,7 +290,7 @@ namespace RBLXExecutor
 {
     public class MainForm : Form
     {
-        // ── Win32 P/Invoke ─────────────────────────────────────────────────
+        // ── Win32 P/Invoke ──────────────────────────────────────────────────────
         const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
 
         [DllImport("kernel32.dll", SetLastError=true)]
@@ -318,9 +318,20 @@ namespace RBLXExecutor
         [DllImport("kernel32.dll")]
         static extern bool GetExitCodeThread(IntPtr h, out uint code);
 
-        // Pseudo-handle -1 pour le processus courant (pas besoin d'OpenProcess)
         [DllImport("kernel32.dll")]
         static extern IntPtr GetCurrentProcess();
+
+        // ── VirtualAllocEx / Write / Free — pour strings DATA (pas pour code) ───
+        // ACG bloque l'EXECUTION de pages dynamiques, pas leur allocation/ecriture.
+        // On peut donc allouer PAGE_READWRITE sans probleme pour le chemin DLL.
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern IntPtr VirtualAllocEx(IntPtr hP, IntPtr addr, uint sz, uint type, uint prot);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool WriteProcessMemory(IntPtr hP, IntPtr addr, byte[] buf, int sz, out int written);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool VirtualFreeEx(IntPtr hP, IntPtr addr, uint sz, uint type);
 
         // ── NT API: bypass ACG via MEM_MAPPED (section objects) ─────────────────
         // ACG (ProcessDynamicCodePolicy) bloque les pages MEM_PRIVATE executables.
@@ -384,7 +395,7 @@ namespace RBLXExecutor
             public uint dwFlags;
         }
 
-        // ── Scripts Lua pre-charges ───────────────────────────────────────────
+        // ── Scripts Lua pre-charges ─────────────────────────────────────────────
         const string DASH_SCRIPT =
 @"-- INFINITE DASHES (Appuie Q pour dash sans cooldown)
 local Players = game:GetService('Players')
@@ -432,7 +443,7 @@ task.spawn(function()
     end
 end)";
 
-        // ── UI ────────────────────────────────────────────────────────────────
+        // ── UI ─────────────────────────────────────────────────────────────────
         RichTextBox scriptBox;
         ListBox     logBox;
         Button      injectBtn, execBtn, dashBtn, crashBtn, clearBtn;
@@ -441,7 +452,7 @@ end)";
 
         public MainForm()
         {
-            this.Text            = "RBX Executor v2.3";
+            this.Text            = "RBX Executor v2.4";
             this.Size            = new Size(800, 580);
             this.BackColor       = Color.FromArgb(12, 12, 28);
             this.ForeColor       = Color.White;
@@ -551,7 +562,17 @@ end)";
             SetStatus("● Injection...", Color.Orange);
 
             string errMsg = "";
-            bool ok = ManualMap(procs[0].Id, File.ReadAllBytes(dllPath), ref errMsg);
+            // METHODE A : LoadLibraryA — thread demarre dans kernel32 (MEM_IMAGE)
+            //   Hyperion verifie start-adresse du thread : doit etre dans MEM_IMAGE.
+            //   CreateRemoteThread(LoadLibraryA, pathMem) -> start addr = kernel32 -> OK.
+            bool ok = InjectLoadLibrary(procs[0].Id, dllPath, ref errMsg);
+            if (!ok) {
+                Log($"[~] LoadLibA: {errMsg}");
+                Log("[~] Fallback ManualMap + APC...");
+                // METHODE B : ManualMap (NtMapViewOfSection) + APC
+                //   Si CIG actif LoadLib retourne NULL; on passe ici.
+                ok = ManualMap(procs[0].Id, File.ReadAllBytes(dllPath), ref errMsg);
+            }
             if (ok) {
                 Log($"[+] INJECTION OK  ({errMsg})");
                 Log("[*] Attends 10s que FinderThread scanne Lua, puis EXECUTE");
@@ -591,13 +612,92 @@ end)";
             }
         }
 
-        // ── Manual PE Mapper x64 — ACG bypass via NtMapViewOfSection ─────────────
+        // ── Methode A : LoadLibraryA injection ────────────────────────────────
+        //
+        //  Hyperion (Byfron) utilise PsSetCreateThreadNotifyRoutine cote kernel
+        //  pour intercepter chaque creation de thread. Il verifie que la start
+        //  adresse est dans une page MEM_IMAGE (module signe charge par le loader).
+        //  CreateRemoteThread(hP, ..., LoadLibraryA, pathMem) -> start addr =
+        //  adresse de LoadLibraryA dans kernel32.dll (MEM_IMAGE) -> check passe.
+        //  Le thread demarre, charge notre DLL via le loader Windows, elle est
+        //  mappee comme MEM_IMAGE -> DllMain s'execute proprement.
+        //
+        //  Si CIG (Code Integrity Guard) est actif : LoadLibraryA retourne NULL
+        //  car notre DLL n'est pas signee. exitCode == 0 -> caller fait fallback.
+        // ──────────────────────────────────────────────────────────────────────
+        static bool InjectLoadLibrary(int pid, string dllPath, ref string err) {
+            const uint PROCESS_ALL_ACCESS = 0x1F0FFF;
+            IntPtr hP = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
+            if (hP == IntPtr.Zero) {
+                err = $"OP err {Marshal.GetLastWin32Error()}"; return false;
+            }
+
+            // Alloue de la memoire DATA (MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+            // pour le chemin DLL — pas d'execution de code ici, juste une string.
+            byte[] pathBytes = System.Text.Encoding.UTF8.GetBytes(dllPath + '\0');
+            IntPtr pathMem = VirtualAllocEx(hP, IntPtr.Zero,
+                (uint)(pathBytes.Length + 1), 0x3000 /*MEM_COMMIT|MEM_RESERVE*/,
+                0x04 /*PAGE_READWRITE*/);
+            if (pathMem == IntPtr.Zero) {
+                CloseHandle(hP);
+                err = $"VAllocEx err {Marshal.GetLastWin32Error()}"; return false;
+            }
+
+            int wr;
+            if (!WriteProcessMemory(hP, pathMem, pathBytes, pathBytes.Length, out wr)) {
+                VirtualFreeEx(hP, pathMem, 0, 0x8000);
+                CloseHandle(hP);
+                err = $"WPM err {Marshal.GetLastWin32Error()}"; return false;
+            }
+
+            // GetProcAddress de LoadLibraryA dans kernel32 local :
+            // kernel32.dll est charge a la meme adresse dans tous les processus
+            // (ASLR par session, pas par processus) -> valide pour le remote.
+            IntPtr k32  = LoadLibraryA("kernel32.dll");
+            IntPtr llA  = GetProcAddress(k32, "LoadLibraryA");
+            if (llA == IntPtr.Zero) {
+                VirtualFreeEx(hP, pathMem, 0, 0x8000);
+                CloseHandle(hP);
+                err = "GetProcAddr(LoadLibraryA) = NULL"; return false;
+            }
+
+            uint tid;
+            // Thread demarre a LoadLibraryA (MEM_IMAGE dans kernel32.dll)
+            // -> bypasse le check start-adresse de Hyperion.
+            IntPtr hThread = CreateRemoteThread(hP, IntPtr.Zero, 0,
+                llA, pathMem, 0, out tid);
+            if (hThread == IntPtr.Zero) {
+                int e2 = Marshal.GetLastWin32Error();
+                VirtualFreeEx(hP, pathMem, 0, 0x8000);
+                CloseHandle(hP);
+                err = $"CRT(LLA) err {e2}"; return false;
+            }
+
+            WaitForSingleObject(hThread, 12000);
+            uint exitCode = 0;
+            GetExitCodeThread(hThread, out exitCode);
+            CloseHandle(hThread);
+            VirtualFreeEx(hP, pathMem, 0, 0x8000);
+            CloseHandle(hP);
+
+            // exitCode = valeur de retour de LoadLibraryA = HMODULE (non-nul si ok)
+            // Sur CIG actif ou si DLL introuvable : LoadLib retourne NULL -> 0.
+            if (exitCode == 0) {
+                err = "LoadLib NULL (CIG actif ou DLL path invalide)"; return false;
+            }
+            err = $"LoadLib ok hMod=0x{exitCode:X8}";
+            return true;
+        }
+
+        // ── Methode B : Manual PE Mapper x64 ─────────────────────────────────
         //
         //  Hyperion active ProcessDynamicCodePolicy (ACG) sur Roblox.
         //  VirtualAllocEx cree des pages MEM_PRIVATE : execution bloquee
         //  avec STATUS_DYNAMIC_CODE_BLOCKED (0xC000071C).
         //  NtMapViewOfSection cree des pages MEM_MAPPED : le kernel n'applique
         //  pas le check ACG sur ces pages, l'execution est autorisee.
+        //  Si Hyperion bloque aussi CRT (start addr pas MEM_IMAGE) ->
+        //  fallback NtQueueApcThread sur threads Roblox existants.
         //
         //  Flow:
         //    1. NtCreateSection (SEC_COMMIT, RWX) pour l'image DLL
@@ -605,12 +705,11 @@ end)";
         //    3. NtMapViewOfSection remote (RWX) dans Roblox
         //    4. Copie de l'image patchee dans la vue locale
         //    5. Meme chose pour le bloc shellcode+params (section separee)
-        //    6. CreateRemoteThread sur le shellcode dans la section remote
-        //    7. Fallback: NtQueueApcThread si CRT refuse (Hyperion THREAD_BLOCK)
+        //    6. CreateRemoteThread (si start MEM_MAPPED accepte) sinon APC
         // ──────────────────────────────────────────────────────────────────────
         static bool ManualMap(int pid, byte[] raw, ref string err)
         {
-            // ── Parse PE32+ headers ────────────────────────────────────
+            // ── Parse PE32+ headers ──────────────────────────────────────────
             if (raw.Length < 0x40 || raw[0] != 0x4D || raw[1] != 0x5A)
                 { err = "Bad MZ"; return false; }
             int pe = BitConverter.ToInt32(raw, 0x3C);
@@ -639,7 +738,7 @@ end)";
             if (hP == IntPtr.Zero)
                 { err = $"OpenProcess err {Marshal.GetLastWin32Error()}"; return false; }
 
-            // ── Section DLL image ─────────────────────────────────────────
+            // ── Section DLL image ─────────────────────────────────────────────
             // Taille alignee sur page (4 Ko)
             long dllSecSz = ((long)iSz + 0xFFF) & ~0xFFFL;
             IntPtr hDllSec;
@@ -766,7 +865,7 @@ end)";
             NtUnmapViewOfSection(GetCurrentProcess(), localDll);
             NtClose(hDllSec);
 
-            // ── Section shellcode+params ──────────────────────────────────
+            // ── Section shellcode+params ──────────────────────────────────────
             // Layout: [0..7] = hModule (remoteDll), [8..15] = DllMain, [16..41] = shellcode
             ulong epAbs = (ulong)remoteDll + epRva;
 
@@ -832,7 +931,7 @@ end)";
             NtUnmapViewOfSection(GetCurrentProcess(), localSc);
             NtClose(hScSec);
 
-            // ── Lancer le thread dans Roblox ──────────────────────────────
+            // ── Lancer le thread dans Roblox ──────────────────────────────────
             // Methode A : CreateRemoteThread (MEM_MAPPED -> pas bloque par ACG)
             // Methode B : NtQueueApcThread   (fallback si CRT refuse)
             uint tid;
@@ -842,18 +941,27 @@ end)";
                 0, out tid);
 
             if (hThread != IntPtr.Zero) {
-                // CRT reussi : attendre et lire exit code
                 WaitForSingleObject(hThread, 8000);
                 uint exitCode = 0xDEAD;
                 GetExitCodeThread(hThread, out exitCode);
                 CloseHandle(hThread);
-                NtUnmapViewOfSection(hP, remoteSc);
-                CloseHandle(hP);
-                err = $"CRT ok threadExit=0x{exitCode:X}";
-                return true;
+                // exitCode 0 = DllMain retourne FALSE, 1 = TRUE (succes normal)
+                // exitCode 0xC000071C = STATUS_DYNAMIC_CODE_BLOCKED -> Hyperion
+                //   a tue le thread AVANT la premiere instruction (start addr pas
+                //   MEM_IMAGE). Dans ce cas on ne retourne pas — on tombe dans
+                //   le bloc APC ci-dessous pour tenter sur un thread existant.
+                if (exitCode == 0 || exitCode == 1) {
+                    NtUnmapViewOfSection(hP, remoteSc);
+                    CloseHandle(hP);
+                    err = $"MM CRT ok threadExit=0x{exitCode:X}";
+                    return true;
+                }
+                // Mauvais exit code (ex: 0xC000071C) -> thread tue par Hyperion
+                // Ne pas unmap remoteSc ici : l'APC en a besoin comme ApcRoutine
+                // Ne pas unmap remoteDll ici non plus : DLL code + FinderThread
             }
 
-            // ── Fallback APC: Hyperion bloque CRT ───────────────────────────
+            // ── Fallback APC: Hyperion bloque CRT (start addr pas MEM_IMAGE) ──
             // NtQueueApcThread sur chaque thread Roblox.
             // L'APC se declenche quand un thread entre en attente alertable.
             // Meme shellcode : rcx = arg1 = remoteSc (params block)
@@ -907,7 +1015,7 @@ end)";
     }
 }
 '@
-Write-Host "[+] MainForm.cs ecrit (ACG bypass NtMapViewOfSection + APC fallback)" -ForegroundColor Green
+Write-Host "[+] MainForm.cs ecrit (v2.4 LoadLibA primary + ManualMap+APC fallback)" -ForegroundColor Green
 
 # ────────────────────────────────────────────────────────────
 #  3) executor.csproj
@@ -990,9 +1098,9 @@ Write-Host "[+] RBLXExecutor.exe copie !" -ForegroundColor Green
 #  DONE
 # ────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "╔═════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║     INSTALLATION COMPLETE (v2.3 ACG+APC)    ║" -ForegroundColor Green
-Write-Host "╚═════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host "║     INSTALLATION COMPLETE (v2.4 LoadLib+APC) ║" -ForegroundColor Green
+Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Fichiers dans : $dest" -ForegroundColor White
 Write-Host "    RBLXExecutor.exe  <- l'executeur" -ForegroundColor Cyan
@@ -1001,13 +1109,13 @@ Write-Host ""
 Write-Host "  PROCEDURE :" -ForegroundColor Yellow
 Write-Host "  1. Lance Roblox et rejoins une partie" -ForegroundColor White
 Write-Host "  2. Lance RBLXExecutor.exe (en Admin si besoin)" -ForegroundColor White
-Write-Host "  3. Clique INJECT  (attends 'INJECTION OK')" -ForegroundColor White
+Write-Host "  3. Clique INJECT" -ForegroundColor White
+Write-Host "     - Si CIG off : 'INJECTION OK (LoadLib ok hMod=0x...)'" -ForegroundColor White
+Write-Host "     - Si CIG on  : 'LoadLibA: NULL -> APC queued x{N} threads'" -ForegroundColor White
 Write-Host "  4. Attends 10-15 secondes" -ForegroundColor White
 Write-Host "  5. Clique  INFINITE DASHES  ou  CRASH  puis EXECUTE" -ForegroundColor White
 Write-Host ""
 Write-Host "  Debug log: $dbg" -ForegroundColor Gray
-Write-Host "  -> Si CRT ok: 'CRT ok threadExit=0x1'" -ForegroundColor Gray
-Write-Host "  -> Si APC:    'APC queued xN threads'" -ForegroundColor Gray
-Write-Host "  -> DLL log:   '[DllMain] DLL_PROCESS_ATTACH - injection OK !'" -ForegroundColor Gray
-Write-Host "  -> Puis:      '[FinderThread] Lua TROUVE !'" -ForegroundColor Gray
+Write-Host "  -> Si OK: '[DllMain] DLL_PROCESS_ATTACH - injection OK !'" -ForegroundColor Gray
+Write-Host "  -> Puis:  '[FinderThread] Lua TROUVE !'" -ForegroundColor Gray
 Write-Host ""
