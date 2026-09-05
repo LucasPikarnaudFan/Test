@@ -263,10 +263,12 @@ extern "C" __declspec(dllexport) DWORD WINAPI RbxExecute(const char* script, int
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI ExecFromParam(LPVOID param) {
+    dbg("[ExecFromParam] APPELE");
     const char* s = (const char*)param;
-    if (!s) return 2;
-    // Appel tryExecScript: fait le scan Lua en un seul passage si pas encore pret.
-    return tryExecScript(s, lstrlenA(s)) ? 0 : 1;
+    if (!s) { dbg("[ExecFromParam] param NULL"); return 2; }
+    bool ok = tryExecScript(s, lstrlenA(s));
+    dbg(ok ? "[ExecFromParam] OK" : "[ExecFromParam] ECHEC");
+    return ok ? 0 : 1;
 }
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
@@ -285,16 +287,25 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
 // Appele depuis ExecFromParam (via TCtxHijack au moment EXECUTE).
 // Fait un scan Lua en un seul passage (pas de Sleep/loop = safe en thread game).
 static bool tryExecScript(const char* script, int len) {
+    dbg("[tryExec] enter");
     if (InterlockedCompareExchange(&g_ready, 0, 0) != 1) {
-        // Un seul passage de scan - typiquement <50ms
-        if (findLua()) InterlockedExchange(&g_ready, 1);
+        dbg("[tryExec] scan lua...");
+        if (findLua()) {
+            InterlockedExchange(&g_ready, 1);
+            dbg("[tryExec] lua TROUVE !");
+        } else {
+            dbg("[tryExec] lua NON TROUVE - patterns invalides ou trop tot");
+            return false;
+        }
+    } else {
+        dbg("[tryExec] lua deja pret");
     }
-    if (InterlockedCompareExchange(&g_ready, 0, 0) != 1) return false;
     void* L = g_stateRef ? *g_stateRef : nullptr;
-    if (!L || !g_load || !g_pcall) return false;
+    if (!L) { dbg("[tryExec] lua_State NULL"); return false; }
+    if (!g_load || !g_pcall) { dbg("[tryExec] load/pcall NULL"); return false; }
     int r = g_load(L, script, (size_t)len, "=rbx");
     if (r == 0) g_pcall(L, 0, -1, 0);
-    dbg(r == 0 ? "[Exec] OK" : "[Exec] LOAD_ERR");
+    dbg(r == 0 ? "[tryExec] OK - script execute !" : "[tryExec] LOAD_ERR");
     return r == 0;
 }
 '@
