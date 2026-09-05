@@ -283,6 +283,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
 using System.Windows.Forms;
 using System.Drawing;
 
@@ -384,6 +385,22 @@ namespace RBLXExecutor
         [DllImport("kernel32.dll", SetLastError=true)]
         static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
 
+        [DllImport("kernel32.dll")]
+        static extern uint SuspendThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll")]
+        static extern uint ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool GetThreadContext(IntPtr hThread, IntPtr lpContext);
+
+        [DllImport("kernel32.dll", SetLastError=true)]
+        static extern bool SetThreadContext(IntPtr hThread, IntPtr lpContext);
+
+        [DllImport("kernel32.dll")]
+        static extern bool GetThreadTimes(IntPtr hThread,
+            out long creation, out long exit, out long kernel, out long user);
+
         [StructLayout(LayoutKind.Sequential)]
         struct THREADENTRY32 {
             public uint dwSize;
@@ -452,7 +469,7 @@ end)";
 
         public MainForm()
         {
-            this.Text            = "RBX Executor v2.4";
+            this.Text            = "RBX Executor v2.5";
             this.Size            = new Size(800, 580);
             this.BackColor       = Color.FromArgb(12, 12, 28);
             this.ForeColor       = Color.White;
@@ -568,8 +585,8 @@ end)";
             bool ok = InjectLoadLibrary(procs[0].Id, dllPath, ref errMsg);
             if (!ok) {
                 Log($"[~] LoadLibA: {errMsg}");
-                Log("[~] Fallback ManualMap + APC...");
-                // METHODE B : ManualMap (NtMapViewOfSection) + APC
+                Log("[~] Fallback ManualMap + TCtxHijack + APC...");
+                // METHODE B : ManualMap (NtMapViewOfSection) + Thread Context Hijack + APC
                 //   Si CIG actif LoadLib retourne NULL; on passe ici.
                 ok = ManualMap(procs[0].Id, File.ReadAllBytes(dllPath), ref errMsg);
             }
@@ -684,7 +701,7 @@ end)";
             // 0          -> LoadLib retourne NULL (CIG actif, DLL non signee)
             // >= 0x80000000 -> NTSTATUS error (ex: 0xC000071C = Hyperion bloque le
             //   chargement de la DLL PENDANT LoadLibraryA, pas au demarrage du thread)
-            // Dans les deux cas -> fallback ManualMap+APC
+            // Dans les deux cas -> fallback ManualMap+TCtxHijack+APC
             if (exitCode == 0 || exitCode >= 0x80000000u) {
                 err = $"LoadLib fail 0x{exitCode:X8} (Hyperion DLL block ou CIG)"; return false;
             }
@@ -700,7 +717,8 @@ end)";
         //  NtMapViewOfSection cree des pages MEM_MAPPED : le kernel n'applique
         //  pas le check ACG sur ces pages, l'execution est autorisee.
         //  Si Hyperion bloque aussi CRT (start addr pas MEM_IMAGE) ->
-        //  fallback NtQueueApcThread sur threads Roblox existants.
+        //  Fallback 1: Thread Context Hijack sur thread le plus idle de Roblox.
+        //  Fallback 2: NtQueueApcThread (last resort, ne fire pas sous Hyperion).
         //
         //  Flow:
         //    1. NtCreateSection (SEC_COMMIT, RWX) pour l'image DLL
@@ -708,7 +726,7 @@ end)";
         //    3. NtMapViewOfSection remote (RWX) dans Roblox
         //    4. Copie de l'image patchee dans la vue locale
         //    5. Meme chose pour le bloc shellcode+params (section separee)
-        //    6. CreateRemoteThread (si start MEM_MAPPED accepte) sinon APC
+        //    6. CreateRemoteThread (si start MEM_MAPPED accepte) sinon TCtxHijack sinon APC
         // ──────────────────────────────────────────────────────────────────────
         static bool ManualMap(int pid, byte[] raw, ref string err)
         {
@@ -869,10 +887,17 @@ end)";
             NtClose(hDllSec);
 
             // ── Section shellcode+params ──────────────────────────────────────
-            // Layout: [0..7] = hModule (remoteDll), [8..15] = DllMain, [16..41] = shellcode
+            // Layout du scBlock (0x1000 octets):
+            //   [0..7]   = hModule (remoteDll)
+            //   [8..15]  = DllMain entry point (epAbs)
+            //   [16..41] = APC shellcode (26 bytes)
+            //   [42..47] = padding
+            //   [48..55] = origRip slot (ecrit par C# via WriteProcessMemory avant SetThreadContext)
+            //   [56..63] = padding
+            //   [64..101]= hijack shellcode (38 bytes)
             ulong epAbs = (ulong)remoteDll + epRva;
 
-            // Shellcode 26 octets: appelle DllMain(hMod, DLL_PROCESS_ATTACH, 0)
+            // Shellcode APC 26 octets: appelle DllMain(hMod, DLL_PROCESS_ATTACH, 0)
             //   sub rsp,28h
             //   mov rax,rcx        ; rcx = pointeur vers le bloc params
             //   mov edx,1          ; DLL_PROCESS_ATTACH
@@ -892,10 +917,38 @@ end)";
                 0xC3
             };
 
+            // Hijack shellcode 38 octets: execute DllMain puis retourne au thread hijacke
+            //   mov rax, rcx           ; rax = params block
+            //   mov r11, [rax+0x30]    ; origRip (params[48])
+            //   mov r10, rsp           ; sauvegarde RSP
+            //   and rsp, -16           ; aligne pile sur 16 octets
+            //   sub rsp, 0x28          ; shadow space x64
+            //   mov edx, 1             ; DLL_PROCESS_ATTACH
+            //   xor r8, r8
+            //   mov rcx, [rax]         ; hModule = params[0]
+            //   call [rax+8]           ; DllMain = params[8]
+            //   mov rsp, r10           ; restaure RSP original
+            //   jmp r11                ; reprend execution du thread au point exact
+            byte[] hsc = new byte[] {
+                0x48,0x8B,0xC1,            // mov rax, rcx
+                0x4C,0x8B,0x58,0x30,       // mov r11, [rax+0x30]  <- origRip at params+48
+                0x4C,0x8B,0xD4,            // mov r10, rsp
+                0x48,0x83,0xE4,0xF0,       // and rsp, -16
+                0x48,0x83,0xEC,0x28,       // sub rsp, 0x28
+                0xBA,0x01,0x00,0x00,0x00,  // mov edx, 1 (DLL_PROCESS_ATTACH)
+                0x4D,0x33,0xC0,            // xor r8, r8
+                0x48,0x8B,0x08,            // mov rcx, [rax]       <- hModule
+                0xFF,0x50,0x08,            // call [rax+8]         <- DllMain
+                0x49,0x8B,0xE2,            // mov rsp, r10         <- restore RSP
+                0x41,0xFF,0xE3             // jmp r11              <- return to origRip
+            };
+
             byte[] scBlock = new byte[0x1000];
             Array.Copy(BitConverter.GetBytes((ulong)remoteDll), 0, scBlock,  0, 8);
             Array.Copy(BitConverter.GetBytes(epAbs),            0, scBlock,  8, 8);
             Array.Copy(sc,                                      0, scBlock, 16, 26);
+            Array.Copy(hsc,                                     0, scBlock, 64, hsc.Length);
+            // scBlock[48..55] = origRip slot, written per-thread by hijack code below
 
             long scSecSz = 0x1000L;
             IntPtr hScSec;
@@ -936,10 +989,9 @@ end)";
 
             // ── Lancer le thread dans Roblox ──────────────────────────────────
             // Methode A : CreateRemoteThread (MEM_MAPPED -> pas bloque par ACG)
-            // Methode B : NtQueueApcThread   (fallback si CRT refuse)
             uint tid;
             IntPtr hThread = CreateRemoteThread(hP, IntPtr.Zero, 0,
-                IntPtr.Add(remoteSc, 16),   // entry = shellcode
+                IntPtr.Add(remoteSc, 16),   // entry = shellcode APC
                 remoteSc,                   // param = params block
                 0, out tid);
 
@@ -951,24 +1003,96 @@ end)";
                 // exitCode 0 = DllMain retourne FALSE, 1 = TRUE (succes normal)
                 // exitCode 0xC000071C = STATUS_DYNAMIC_CODE_BLOCKED -> Hyperion
                 //   a tue le thread AVANT la premiere instruction (start addr pas
-                //   MEM_IMAGE). Dans ce cas on ne retourne pas — on tombe dans
-                //   le bloc APC ci-dessous pour tenter sur un thread existant.
+                //   MEM_IMAGE). Dans ce cas on tombe dans Fallback 1 (TCtxHijack).
                 if (exitCode == 0 || exitCode == 1) {
                     NtUnmapViewOfSection(hP, remoteSc);
                     CloseHandle(hP);
                     err = $"MM CRT ok threadExit=0x{exitCode:X}";
                     return true;
                 }
-                // Mauvais exit code (ex: 0xC000071C) -> thread tue par Hyperion
-                // Ne pas unmap remoteSc ici : l'APC en a besoin comme ApcRoutine
-                // Ne pas unmap remoteDll ici non plus : DLL code + FinderThread
+                // Mauvais exit code -> thread tue par Hyperion
+                // Ne pas unmap remoteSc/remoteDll : Fallback 1 en a besoin
             }
 
-            // ── Fallback APC: Hyperion bloque CRT (start addr pas MEM_IMAGE) ──
+            // ── Fallback 1: Thread Context Hijack ────────────────────────────────
+            // Roblox threads sous Hyperion n'entrent jamais en alertable wait
+            // donc l'APC ne fire pas. A la place: SuspendThread + GetThreadContext
+            // + WriteProcessMemory(origRip->params[48]) + SetThreadContext(RIP=sc+64)
+            // + ResumeThread. Le thread hijacke execute DllMain directement puis
+            // reprend son execution normale (RSP restaure via r10, jmp r11 = origRip).
+            int crtErr = Marshal.GetLastWin32Error();
+            bool hijackOk = false;
+            {
+                var tidList = new List<uint>();
+                IntPtr hSnap2 = CreateToolhelp32Snapshot(0x4, 0);
+                if (hSnap2 != (IntPtr)(-1)) {
+                    var te2 = new THREADENTRY32();
+                    te2.dwSize = (uint)Marshal.SizeOf<THREADENTRY32>();
+                    if (Thread32First(hSnap2, ref te2)) {
+                        do {
+                            if ((int)te2.th32OwnerProcessID == pid) tidList.Add(te2.th32ThreadID);
+                        } while (Thread32Next(hSnap2, ref te2));
+                    }
+                    CloseHandle(hSnap2);
+                }
+                // Sort ascending by CPU time: most idle thread first (least likely to hold a lock)
+                tidList.Sort((a, b) => {
+                    long ka=0,ua=0,kb=0,ub=0,dummy=0;
+                    IntPtr ha = OpenThread(0x40 /*QUERY_INFORMATION*/, false, a);
+                    if (ha != IntPtr.Zero) { GetThreadTimes(ha,out dummy,out dummy,out ka,out ua); CloseHandle(ha); }
+                    IntPtr hb = OpenThread(0x40, false, b);
+                    if (hb != IntPtr.Zero) { GetThreadTimes(hb,out dummy,out dummy,out kb,out ub); CloseHandle(hb); }
+                    return (ka+ua).CompareTo(kb+ub);
+                });
+                foreach (uint htid in tidList) {
+                    IntPtr hThr = OpenThread(0x1F03FF, false, htid);
+                    if (hThr == IntPtr.Zero) continue;
+                    uint suspRet = SuspendThread(hThr);
+                    if (suspRet == 0xFFFFFFFFu) { CloseHandle(hThr); continue; }
+
+                    // CONTEXT x64 = 1232 bytes, must be 16-byte aligned
+                    byte[] ctxBuf = new byte[1232 + 16];
+                    GCHandle pin = GCHandle.Alloc(ctxBuf, GCHandleType.Pinned);
+                    IntPtr ctxRaw = pin.AddrOfPinnedObject();
+                    int ao = (int)((16 - ((long)ctxRaw & 15)) & 15);
+                    IntPtr ctxPtr = IntPtr.Add(ctxRaw, ao);
+
+                    // ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER = 0x100003
+                    System.Buffer.BlockCopy(BitConverter.GetBytes(0x100003u), 0, ctxBuf, ao + 0x30, 4);
+                    bool gotCtx = GetThreadContext(hThr, ctxPtr);
+                    if (gotCtx) {
+                        ulong origRip = BitConverter.ToUInt64(ctxBuf, ao + 0xF8);
+                        // Store origRip at remoteSc+48 (hijack shellcode reads it as params[0x30])
+                        int wrt;
+                        WriteProcessMemory(hP, IntPtr.Add(remoteSc, 48),
+                            BitConverter.GetBytes(origRip), 8, out wrt);
+                        // RCX = remoteSc (params), RIP = remoteSc+64 (hijack shellcode)
+                        System.Buffer.BlockCopy(BitConverter.GetBytes((ulong)remoteSc),
+                            0, ctxBuf, ao + 0x80, 8);
+                        System.Buffer.BlockCopy(BitConverter.GetBytes((ulong)remoteSc + 64),
+                            0, ctxBuf, ao + 0xF8, 8);
+                        bool setOk = SetThreadContext(hThr, ctxPtr);
+                        pin.Free();
+                        ResumeThread(hThr);
+                        CloseHandle(hThr);
+                        if (setOk) {
+                            hijackOk = true;
+                            err = $"TCtx hijack tid={htid} origRip=0x{origRip:X}";
+                            break;
+                        }
+                    } else {
+                        pin.Free();
+                        ResumeThread(hThr);
+                        CloseHandle(hThr);
+                    }
+                }
+            }
+            if (hijackOk) { CloseHandle(hP); return true; }
+
+            // ── Fallback 2: APC (last resort) ────────────────────────────────────
             // NtQueueApcThread sur chaque thread Roblox.
             // L'APC se declenche quand un thread entre en attente alertable.
-            // Meme shellcode : rcx = arg1 = remoteSc (params block)
-            int crtErr = Marshal.GetLastWin32Error();
+            // Connu pour ne pas fire sous Hyperion (threads jamais en alertable wait).
             bool apcOk = false;
             int  apcCnt = 0;
 
@@ -1018,7 +1142,7 @@ end)";
     }
 }
 '@
-Write-Host "[+] MainForm.cs ecrit (v2.4 LoadLibA primary + ManualMap+APC fallback)" -ForegroundColor Green
+Write-Host "[+] MainForm.cs ecrit (v2.5 LoadLibA + ManualMap + TCtxHijack + APC)" -ForegroundColor Green
 
 # ────────────────────────────────────────────────────────────
 #  3) executor.csproj
@@ -1101,9 +1225,9 @@ Write-Host "[+] RBLXExecutor.exe copie !" -ForegroundColor Green
 #  DONE
 # ────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║     INSTALLATION COMPLETE (v2.4 LoadLib+APC) ║" -ForegroundColor Green
-Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host "║  INSTALLATION COMPLETE (v2.5 TCtxHijack+APC)    ║" -ForegroundColor Green
+Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Fichiers dans : $dest" -ForegroundColor White
 Write-Host "    RBLXExecutor.exe  <- l'executeur" -ForegroundColor Cyan
@@ -1113,8 +1237,9 @@ Write-Host "  PROCEDURE :" -ForegroundColor Yellow
 Write-Host "  1. Lance Roblox et rejoins une partie" -ForegroundColor White
 Write-Host "  2. Lance RBLXExecutor.exe (en Admin si besoin)" -ForegroundColor White
 Write-Host "  3. Clique INJECT" -ForegroundColor White
-Write-Host "     - Si CIG off : 'INJECTION OK (LoadLib ok hMod=0x...)'" -ForegroundColor White
-Write-Host "     - Si CIG on  : 'LoadLibA: NULL -> APC queued x{N} threads'" -ForegroundColor White
+Write-Host "     - Si LoadLib ok     : 'INJECTION OK (LoadLib ok hMod=0x...)'" -ForegroundColor White
+Write-Host "     - Si TCtx hijack ok : 'INJECTION OK (TCtx hijack tid=... origRip=0x...)'" -ForegroundColor White
+Write-Host "     - Si APC fallback   : 'APC queued x{N} threads'" -ForegroundColor White
 Write-Host "  4. Attends 10-15 secondes" -ForegroundColor White
 Write-Host "  5. Clique  INFINITE DASHES  ou  CRASH  puis EXECUTE" -ForegroundColor White
 Write-Host ""
