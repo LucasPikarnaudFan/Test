@@ -270,20 +270,23 @@ extern "C" __declspec(dllexport) DWORD WINAPI ExecFromParam(LPVOID param) {
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        dbg("[DllMain] DLL_PROCESS_ATTACH - injection OK !");
+        dbg("[DllMain] attached - scan Lua sync (2s max, 0 thread cree)");
 
         auto NtSIT = reinterpret_cast<BOOL(__stdcall*)(HANDLE,ULONG,PVOID,ULONG)>(
             GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationThread"));
         if (NtSIT) NtSIT(GetCurrentThread(), 0x11, nullptr, 0);
 
-        // QueueUserWorkItem: recycle des threads existants du thread pool ntdll
-        // (deja crees avant Hyperion, start addr = ntdll MEM_IMAGE approuve).
-        // Aucun nouveau thread cree = PsSetCreateThreadNotifyRoutine ne fire pas.
-        BOOL fOk = QueueUserWorkItem(FinderThread, nullptr, WT_EXECUTELONGFUNCTION);
-        dbg(fOk ? "[DllMain] FinderThread queued TP" : "[DllMain] FinderThread TP FAILED");
-
-        BOOL pOk = QueueUserWorkItem(PipeThread, nullptr, WT_EXECUTELONGFUNCTION);
-        dbg(pOk ? "[DllMain] PipeThread queued TP" : "[DllMain] PipeThread TP FAILED");
+        // Scan Lua synchronement dans le thread hijacke (pas de CreateThread/QueueUserWorkItem).
+        // Hyperion n'a rien a tuer. Timeout 2s pour ne pas bloquer Roblox trop longtemps.
+        for (int i = 0; i < 20; i++) {
+            if (findLua()) {
+                InterlockedExchange(&g_ready, 1);
+                dbg("[DllMain] Lua FOUND sync !");
+                return TRUE;
+            }
+            Sleep(100);
+        }
+        dbg("[DllMain] Lua non trouve en 2s - EXECUTE tentera M10 (scan externe)");
     }
     return TRUE;
 }
@@ -500,7 +503,7 @@ end)";
 
         public MainForm()
         {
-            this.Text            = "RBX Executor v2.7 - 10x Exec Methods";
+            this.Text            = "RBX Executor v2.8 - Sync Scan + 10x Exec";
             this.Size            = new Size(800, 580);
             this.BackColor       = Color.FromArgb(12, 12, 28);
             this.ForeColor       = Color.White;
@@ -620,7 +623,7 @@ end)";
             }
             if (ok) {
                 Log($"[+] INJECTION OK  ({errMsg})");
-                Log("[*] Attends 10s FinderThread → EXECUTE testera 10 methodes");
+                Log("[*] DllMain scanne Lua sync (2s) - puis EXECUTE directement");
                 SetStatus("● Injecte OK", Color.FromArgb(40, 200, 40));
                 injected = true;
                 _rbxPid    = procs[0].Id;
@@ -1589,8 +1592,7 @@ if (Test-Path $dbg) { Remove-Item $dbg -Force }
 
 $gppArgs = "`"$gpp`" -O2 -std=c++17 -shared -nostartfiles -Wl,-e,DllMain " +
            "`"-o`" `"$dll`" `"$cpp`" " +
-           "-lkernel32 -lpsapi -static-libgcc -static-libstdc++ -s -Wl,--strip-all " +
-           "-Wl,--export-all-symbols 2>&1"
+           "-lkernel32 -lpsapi -static-libgcc -static-libstdc++ -s -Wl,--strip-all 2>&1"
 
 $out = cmd /c $gppArgs
 if ($LASTEXITCODE -eq 0) {
