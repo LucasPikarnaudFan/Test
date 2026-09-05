@@ -56,15 +56,15 @@ static loadbuf_t g_load     = nullptr;
 static pcall_t   g_pcall    = nullptr;
 
 static void dbg(const char* msg) {
-    char path[MAX_PATH];
-    ExpandEnvironmentStringsA("%USERPROFILE%\\Desktop\\rbx_debug.txt", path, MAX_PATH);
-    HANDLE f = CreateFileA(path, FILE_APPEND_DATA,
+    // C:\Windows\Temp\ toujours accessible, meme depuis un process sandboxe
+    HANDLE f = CreateFileA("C:\\Windows\\Temp\\rbx_debug.txt", FILE_APPEND_DATA,
         FILE_SHARE_READ|FILE_SHARE_WRITE,
         nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
-    DWORD w;
+    DWORD w = 0;
     WriteFile(f, msg, (DWORD)lstrlenA(msg), &w, nullptr);
     WriteFile(f, "\r\n", 2, &w, nullptr);
+    FlushFileBuffers(f);
     CloseHandle(f);
 }
 
