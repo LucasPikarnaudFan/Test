@@ -750,29 +750,56 @@ end)";
             CloseHandle(hP);
         }
 
-        // ── FindExport: parse PE export directory ───────────────────────
+        // ── RVA → raw file offset using section table ──────────────────
+        static uint RvaToFO(byte[] raw, int pe, int numSec, int secOff, uint rva) {
+            for (int i = 0; i < numSec; i++) {
+                int   sh   = secOff + i * 40;
+                uint  vA   = BitConverter.ToUInt32(raw, sh + 12);
+                uint  vSz  = BitConverter.ToUInt32(raw, sh +  8);
+                uint  rOff = BitConverter.ToUInt32(raw, sh + 20);
+                uint  rSz  = BitConverter.ToUInt32(raw, sh + 16);
+                uint  span = (vSz > rSz ? rSz : vSz);
+                if (rva >= vA && rva < vA + span && rOff > 0)
+                    return rOff + (rva - vA);
+            }
+            return 0;
+        }
+
+        // ── FindExport: parse PE export directory (raw file bytes) ──────
+        // Returns the export's RVA (add to _remoteDll for absolute addr)
         static ulong FindExport(byte[] raw, string name) {
             if (raw.Length < 0x40) return 0;
-            int pe  = BitConverter.ToInt32(raw, 0x3C);
-            int oh  = pe + 24;
+            int pe     = BitConverter.ToInt32(raw, 0x3C);
+            int oh     = pe + 24;
             if (BitConverter.ToUInt16(raw, oh) != 0x020B) return 0;
-            int dd  = oh + 112;
+            int optSz  = BitConverter.ToUInt16(raw, pe + 20);
+            int numSec = BitConverter.ToUInt16(raw, pe + 6);
+            int secOff = pe + 24 + optSz;
+            int dd     = oh + 112;
             uint expRva = BitConverter.ToUInt32(raw, dd);
-            if (expRva == 0 || expRva >= raw.Length) return 0;
-            uint nNames  = BitConverter.ToUInt32(raw, (int)expRva + 24);
-            uint addrRva = BitConverter.ToUInt32(raw, (int)expRva + 28);
-            uint nameRva = BitConverter.ToUInt32(raw, (int)expRva + 32);
-            uint ordRva  = BitConverter.ToUInt32(raw, (int)expRva + 36);
-            for (uint i = 0; i < nNames && nameRva + i*4 + 4 <= raw.Length; i++) {
-                uint nOff = BitConverter.ToUInt32(raw, (int)(nameRva + i*4));
-                if (nOff >= raw.Length) continue;
-                int ns = (int)nOff, ne = ns;
+            if (expRva == 0) return 0;
+            // Translate export directory RVA → file offset
+            uint expFO = RvaToFO(raw, pe, numSec, secOff, expRva);
+            if (expFO == 0 || expFO + 40 > raw.Length) return 0;
+            uint nNames  = BitConverter.ToUInt32(raw, (int)expFO + 24);
+            uint addrRva = BitConverter.ToUInt32(raw, (int)expFO + 28);
+            uint nameRva = BitConverter.ToUInt32(raw, (int)expFO + 32);
+            uint ordRva  = BitConverter.ToUInt32(raw, (int)expFO + 36);
+            uint addrFO  = RvaToFO(raw, pe, numSec, secOff, addrRva);
+            uint nameFO  = RvaToFO(raw, pe, numSec, secOff, nameRva);
+            uint ordFO   = RvaToFO(raw, pe, numSec, secOff, ordRva);
+            if (addrFO == 0 || nameFO == 0 || ordFO == 0) return 0;
+            for (uint i = 0; i < nNames && nameFO + i*4 + 4 <= raw.Length; i++) {
+                uint nRva = BitConverter.ToUInt32(raw, (int)(nameFO + i*4));
+                uint nFO  = RvaToFO(raw, pe, numSec, secOff, nRva);
+                if (nFO == 0 || nFO >= raw.Length) continue;
+                int ns = (int)nFO, ne = ns;
                 while (ne < raw.Length && raw[ne] != 0) ne++;
                 string eName = System.Text.Encoding.ASCII.GetString(raw, ns, ne - ns);
                 if (eName != name) continue;
-                ushort ord = BitConverter.ToUInt16(raw, (int)(ordRva + i*2));
-                uint fnRva = BitConverter.ToUInt32(raw, (int)(addrRva + ord*4));
-                return fnRva;
+                ushort ord  = BitConverter.ToUInt16(raw, (int)(ordFO + i*2));
+                uint fnRva  = BitConverter.ToUInt32(raw, (int)(addrFO + ord*4));
+                return fnRva;  // RVA — add to _remoteDll for absolute addr
             }
             return 0;
         }
