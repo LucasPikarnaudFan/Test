@@ -680,10 +680,13 @@ end)";
             VirtualFreeEx(hP, pathMem, 0, 0x8000);
             CloseHandle(hP);
 
-            // exitCode = valeur de retour de LoadLibraryA = HMODULE (non-nul si ok)
-            // Sur CIG actif ou si DLL introuvable : LoadLib retourne NULL -> 0.
-            if (exitCode == 0) {
-                err = "LoadLib NULL (CIG actif ou DLL path invalide)"; return false;
+            // exitCode = valeur de retour de LoadLibraryA = HMODULE (non-nul si ok).
+            // 0          -> LoadLib retourne NULL (CIG actif, DLL non signee)
+            // >= 0x80000000 -> NTSTATUS error (ex: 0xC000071C = Hyperion bloque le
+            //   chargement de la DLL PENDANT LoadLibraryA, pas au demarrage du thread)
+            // Dans les deux cas -> fallback ManualMap+APC
+            if (exitCode == 0 || exitCode >= 0x80000000u) {
+                err = $"LoadLib fail 0x{exitCode:X8} (Hyperion DLL block ou CIG)"; return false;
             }
             err = $"LoadLib ok hMod=0x{exitCode:X8}";
             return true;
