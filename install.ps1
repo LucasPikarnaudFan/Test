@@ -55,6 +55,10 @@ static void**    g_stateRef = nullptr;
 static loadbuf_t g_load     = nullptr;
 static pcall_t   g_pcall    = nullptr;
 
+// forward declarations
+static bool tryExecScript(const char* script, int len);
+static void dbg(const char* msg);
+
 static void dbg(const char* msg) {
     // C:\Windows\Temp\ toujours accessible, meme depuis un process sandboxe
     HANDLE f = CreateFileA("C:\\Windows\\Temp\\rbx_debug.txt", FILE_APPEND_DATA,
