@@ -1,0 +1,4 @@
+Agent-Class: TestPayloadAgent
+Launcher-Agent-Class: TestPayloadAgent
+Can-Retransform-Classes: true
+Can-Redefine-Classes: true
